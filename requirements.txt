@@ -1,0 +1,15 @@
+# Pinned to the versions verified in the fdr-text2sql conda env (python 3.12).
+# Install: pip install -r requirements.txt
+
+# runtime
+oracledb==26.1.0
+requests==2.34.2
+python-dotenv==1.2.4
+PyYAML==6.0.3
+
+# notebooks
+nbformat==5.11.1
+nbclient==0.11.0
+
+# tests
+pytest==9.2.0

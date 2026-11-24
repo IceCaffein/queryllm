@@ -1,0 +1,110 @@
+# ============================================================================
+# QueryLLM PDP & query rules
+# ----------------------------------------------------------------------------
+# WHAT THIS FILE IS
+#   The single source of truth for compliance text that is injected into every
+#   LLM prompt (SQL writer in notebook 03, validator repairs in notebook 04).
+#   Legal prose lives HERE, never hardcoded in notebook code.
+#
+# HOW IT FLOWS
+#   rules.yaml -> render_rules() -> prompt text -> LLM reads it together with
+#   the catalog schema -> the model writes SQL that already complies.
+#
+# EDITING
+#   Hand-edit this file. It is read at runtime, not generated.
+#   NOTE for developers: classification is a technical control aligned with
+#   UU 27/2022 (PDP Law) + PP 33/2026 - it is NOT legal advice; the DPO must
+#   confirm the interpretation against the regulation text.
+#
+# DESIGN DECISION (no approval gates)
+#   Questions are NEVER refused. When a PDP-classified column would appear in
+#   the result, the query must anonymize it (see pdp.handling). The analyst
+#   still gets an answer; only raw personal values never leave the database.
+# ============================================================================
+
+rules_version: "1.2"
+description: >-
+  PDP-aware query rules for QueryLLM, aligned with UU 27/2022 and PP 33/2026.
+  Technical control only, not legal advice. No approval gates: questions are
+  always answered, and any personal data that would appear in the result is
+  anonymized by the query itself.
+
+pdp:
+  # Column-name patterns used to classify columns. Matching is word-boundary
+  # based on the lowercased column name (e.g. "salary" matches SALARY and
+  # AVG_SALARY, but MANAGER_ID does NOT match "age" - that was a substring bug).
+  # IMPORTANT: anything not matched here is NON_PERSONAL, so entity columns
+  # like PRODUCT_NAME / STORE_NAME are safe to show raw. Add patterns for your
+  # real database as needed - Indonesian identifiers are already covered.
+  classification_hints:
+    specific:
+      # "Specific personal data" per UU 27/2022: personal finance, health,
+      # biometrics, government IDs. STRICTEST rule: aggregates only, no raw.
+      - salary
+      - gaji
+      - income
+      - penghasilan
+      - commission
+      - diagnosa
+      - nik
+      - ktp
+      - npwp
+      - bpjs
+      - rekening
+    direct:
+      # Direct identifiers: name, contacts, exact locations, DOB.
+      # Rule: anonymize (mask/token) in the result; may still be used for
+      # joins/filters inside the query - only the OUTPUT is masked.
+      - full_name
+      - first_name
+      - last_name
+      - nama
+      - email
+      - phone
+      - telp
+      - no_hp
+      - street_address
+      - physical_address
+      - delivery_address
+      - alamat
+    indirect:
+      # Indirect identifiers: re-identifying only in combination.
+      # Rule: generalization is enough (the column itself is usually coarse).
+      - gender
+      - marital_status
+      - city
+      - state_province
+      - postal_code
+      - year_of_birth
+      - dob
+      - tanggal_lahir
+  handling:
+    # These strings are rendered into the prompt by render_rules() in
+    # notebooks 03/04 - keep them imperative so the model can follow them.
+    specific: >-
+      aggregate only (SUM/AVG/COUNT/MAX/MIN) - never select raw values, and
+      suppress small cohorts using HAVING COUNT(*) >= 5
+    direct: >-
+      anonymize every direct column in SELECT using a collision-free Oracle
+      hash mask - never return raw values or plain prefix-only masks like 'S***'.
+      Use this exact Oracle SQL pattern (aliasing back to the column name):
+      For emails: CASE WHEN col IS NOT NULL THEN SUBSTR(col, 1, 1) || '***_' || SUBSTR(RAWTOHEX(STANDARD_HASH(LOWER(TRIM(col)), 'SHA256')), 1, 8) || '@***.com' END AS col.
+      For other direct columns: CASE WHEN col IS NOT NULL THEN SUBSTR(TO_CHAR(col), 1, 1) || '***_' || SUBSTR(RAWTOHEX(STANDARD_HASH(LOWER(TRIM(TO_CHAR(col))), 'SHA256')), 1, 8) END AS col
+    indirect: >-
+      generalize fine-grained values in SELECT: bucket year_of_birth to decade
+      (TRUNC(year_of_birth, -1) || 's'), truncate postal_code to first 3 chars
+      (SUBSTR(postal_code, 1, 3) || '**'), and return coarse fields (gender,
+      city, state_province) only in grouped/aggregated queries
+
+query_rules:
+  # Structural SQL rules. Enforcement notes:
+  # - read-only + write-op blocking: enforced in code by the validator guard
+  #   (notebook 04), not just by the prompt
+  # - row limit: enforced by the runtime wrapper (SELECT * FROM (...) ROWNUM<=20)
+  # - anonymization + no SELECT *: prompt-level (the model applies it when
+  #   writing the query); SELECT * is also rejected in the validator guard
+  - "No SELECT * - list explicit columns only"
+  - "SELECT or WITH only; queries are read-only"
+  - "Anonymize every PDP-classified column in the final SELECT list per PDP handling rules (you may still join or filter on raw columns)"
+  - "Row limit is enforced by the runtime wrapper (ROWNUM cap)"
+  - "Resolve relative dates (last year, last month, this quarter) from the DATA itself - e.g. MAX of the date/year columns - never from SYSDATE: the data does not cover the current period"
