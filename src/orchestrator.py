@@ -21,7 +21,10 @@ def explanation_agent(question, sql):
     return llm(prompt, system="You explain SQL queries simply.", session="ses_queryllm_explain")
 
 
-def query_llm(question, catalog, rules, max_retries=3, explain=True):
+def query_llm(question, catalog, rules, max_retries=3, explain=True, execute=False):
+    # execute=False is the web default: the validator runs DB-free static
+    # checks only, so the analyst-facing pipeline can never touch Oracle.
+    # Notebooks pass execute=True for runtime testing (rows, empty results).
     # per-stage durations are recorded in the result (and the logs) so every
     # speed optimization can be measured before/after
     t_start = time.perf_counter()
@@ -41,7 +44,8 @@ def query_llm(question, catalog, rules, max_retries=3, explain=True):
     draft = sql_writer(question, workspaces, catalog, rules)
     t_write = time.perf_counter() - t_write_start
     t_validate_start = time.perf_counter()
-    outcome = validator_agent(question, draft, workspaces, catalog, rules, max_retries=max_retries)
+    outcome = validator_agent(question, draft, workspaces, catalog, rules,
+                              max_retries=max_retries, execute=execute)
     t_validate = time.perf_counter() - t_validate_start
 
     durations = {
@@ -66,12 +70,14 @@ def query_llm(question, catalog, rules, max_retries=3, explain=True):
         "workspaces": workspaces,
         "status": "ok",
         "sql": outcome["sql"],
-        "columns": outcome["columns"],
-        "rows": outcome["rows"],
         "attempts": outcome["attempts"],
         "history": outcome["history"],
         "durations": durations,
+        "validated": outcome.get("validated"),
     }
+    if execute:
+        result["columns"] = outcome["columns"]
+        result["rows"] = outcome["rows"]
     # the dashboard skips the explanation (explain=False): it shows the SQL
     # only, so no explanation LLM call is spent
     if explain:

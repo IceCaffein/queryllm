@@ -89,8 +89,12 @@ Requirements:
 
 - Detail mode ("all rows") bakes `FETCH FIRST 100 ROWS ONLY` into the
   generated SQL.
-- Every query passes the read-only validator guard before it is shown.
-- The LLM reads only `catalog.yaml` + `rules.yaml` - never the database.
+- Every query is validated statically before it is shown: guard + Oracle
+  parse + catalog identifier consistency - the web pipeline NEVER executes
+  SQL and NEVER connects to the database (ORA errors cannot happen here;
+  the analyst runs the SQL in their own client).
+- `dashboard/.env` is LLM-only: no Oracle credentials exist on this server.
+- The LLM reads only `catalog.yaml` + `rules.yaml` - never row data.
 - Speed: the writer/validator run with `enable_thinking=False` (qwen3.8-flash
   generates ~12k hidden reasoning tokens otherwise - 90% of the latency);
   the intent agent keeps thinking ON for routing accuracy. Relative dates

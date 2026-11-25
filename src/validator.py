@@ -4,6 +4,9 @@
 import os
 import re
 
+import sqlglot
+from sqlglot import exp
+
 import oracledb
 
 from src.llm import llm
@@ -22,6 +25,80 @@ def is_safe_sql(sql):
         re.IGNORECASE,
     )
     return not blocked.search(sql)
+
+
+def static_check(sql, workspace_names, catalog):
+    # DB-free validation: guard, Oracle parse, and a catalog identifier check.
+    # Catches the invalid-identifier error class (e.g. ORA-00904 on a column
+    # the catalog never mentioned) without touching the database.
+    # the builtin set lives INSIDE the function so this cell exports verbatim
+    _BUILTIN_IDENTIFIERS = {"ROWNUM", "SYSDATE", "SYSTIMESTAMP", "LEVEL", "NULL", "DUAL"}
+    sql = sql.strip().rstrip(";").strip()
+    if not is_safe_sql(sql):
+        return "not a SELECT/WITH statement (or contains write/DDL keywords)"
+    try:
+        tree = sqlglot.parse_one(sql, read="oracle")
+    except Exception as exc:
+        return f"parse error: {str(exc)[:140]}"
+    names = [workspace_names] if isinstance(workspace_names, str) else list(workspace_names)
+    known_tables, known_columns = {"DUAL"}, set()
+    for ws in names:
+        for tname, table in catalog["workspaces"][ws]["tables"].items():
+            known_tables.add(tname.upper())
+            for c in table["columns"]:
+                known_columns.add(c["name"].upper())
+    cte_aliases = {c.alias_or_name.upper() for c in tree.find_all(exp.CTE)}
+    output_aliases = {a.alias_or_name.upper() for a in tree.find_all(exp.Alias)}
+    used_tables = {t.name.upper().split(".")[-1] for t in tree.find_all(exp.Table)}
+    unknown = used_tables - known_tables - cte_aliases
+    if unknown:
+        return f"unknown tables: {', '.join(sorted(unknown))}"
+
+    # per-table column availability: real tables -> their catalog columns;
+    # subquery/CTE references are skipped (the table check covers their names)
+    tables_cols = {}
+    for ws in names:
+        for tname, table in catalog["workspaces"][ws]["tables"].items():
+            tables_cols[tname.upper()] = {c["name"].upper() for c in table["columns"]}
+    alias_map = {}
+    for t in tree.find_all(exp.Table):
+        tname = t.name.upper().split(".")[-1]
+        if t.alias:
+            alias_map[t.alias.upper()] = tname
+        alias_map.setdefault(tname, tname)
+
+    # qualified columns must exist on the table their alias resolves to
+    for col in tree.find_all(exp.Column):
+        if col.table:
+            tname = alias_map.get(col.table.upper())
+            if tname and tname in tables_cols and col.name.upper() not in tables_cols[tname]:
+                return f"unknown column {col.name} for table {tname}"
+
+    # unqualified columns inside single-source selects must belong to that
+    # source table - this is what catches made-up columns in CTE bodies
+    for sel in tree.find_all(exp.Select):
+        # sqlglot 30.x stores the FROM under the key "from_"
+        src_tables = [t for t in (sel.args.get("from_") or exp.select("1")).find_all(exp.Table)]
+        for j in (sel.args.get("joins") or []):
+            src_tables += [t for t in j.find_all(exp.Table)]
+        src_names = {t.name.upper().split(".")[-1] for t in src_tables}
+        if len(src_names) != 1:
+            continue
+        src = next(iter(src_names))
+        if src not in tables_cols:
+            continue
+        allowed = (tables_cols[src]
+                   | {a.alias_or_name.upper() for a in sel.find_all(exp.Alias)}
+                   | output_aliases | cte_aliases | _BUILTIN_IDENTIFIERS)
+        for col in sel.find_all(exp.Column):
+            if col.name.upper() not in allowed:
+                return f"unknown column {col.name} for table {src}"
+
+    used_columns = {c.name.upper() for c in tree.find_all(exp.Column)}
+    unknown = used_columns - known_columns - cte_aliases - output_aliases - _BUILTIN_IDENTIFIERS
+    if unknown:
+        return f"unknown columns: {', '.join(sorted(unknown))}"
+    return None
 
 
 def execute_readonly(sql, workspace_names, catalog, max_rows=20):
@@ -66,27 +143,45 @@ def repair_sql(question, sql, problem, workspace_names, catalog, rules):
     return answer.strip().rstrip(";").strip()
 
 
-def validator_agent(question, sql, workspace_names, catalog, rules, max_retries=3):
+def validator_agent(question, sql, workspace_names, catalog, rules, max_retries=3, execute=True):
+    # Two modes:
+    # - execute=False (the web pipeline): DB-free - static checks only, so no
+    #   query path can ever touch the database
+    # - execute=True (notebook testing): static checks first, then a read-only
+    #   DB round-trip for runtime errors and empty-result detection
     history = []
     for attempt in range(1, max_retries + 1):
-        try:
-            columns, rows = execute_readonly(sql, workspace_names, catalog)
-            if rows:
-                return {
-                    "status": "ok",
-                    "sql": sql,
-                    "columns": columns,
-                    "rows": rows,
-                    "attempts": attempt,
-                    "history": history,
-                }
-            problem = ("The query executed but returned 0 rows. Reconsider the "
-                       "filters, joins and date logic so the question is answered "
-                       "with the data that exists.")
-            history.append({"attempt": attempt, "sql": sql, "outcome": "empty"})
-        except Exception as exc:
-            problem = str(exc).strip() or type(exc).__name__
-            history.append({"attempt": attempt, "sql": sql, "outcome": f"error: {problem[:160]}"})
+        problem = static_check(sql, workspace_names, catalog)
+        if problem is None and execute:
+            try:
+                columns, rows = execute_readonly(sql, workspace_names, catalog)
+                if rows:
+                    return {
+                        "status": "ok",
+                        "sql": sql,
+                        "columns": columns,
+                        "rows": rows,
+                        "attempts": attempt,
+                        "history": history,
+                        "validated": "executed",
+                    }
+                problem = ("The query executed but returned 0 rows. Reconsider the "
+                           "filters, joins and date logic so the question is answered "
+                           "with the data that exists.")
+                history.append({"attempt": attempt, "sql": sql, "outcome": "empty"})
+            except Exception as exc:
+                problem = str(exc).strip() or type(exc).__name__
+                history.append({"attempt": attempt, "sql": sql, "outcome": f"error: {problem[:160]}"})
+        elif problem is None:
+            return {
+                "status": "ok",
+                "sql": sql,
+                "attempts": attempt,
+                "history": history,
+                "validated": "static",
+            }
+        else:
+            history.append({"attempt": attempt, "sql": sql, "outcome": f"static: {problem[:160]}"})
         if attempt == max_retries:
             break
         print(f"  attempt {attempt} -> {history[-1]['outcome'][:60]} | asking the LLM to repair")

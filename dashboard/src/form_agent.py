@@ -52,12 +52,14 @@ def is_forbidden_request(description):
 
 
 def analyze_description(description):
-    # Decide what the request form should contain. Strict JSON out, with
-    # conservative defaults if the model answer is unusable - the form must
-    # always render, never fail.
+    # Intake pattern: ONE llm call classifies the request AND proposes 3-6
+    # request-specific form slots (filters, top-N, ...) so constraints in the
+    # description ("only for New York") reach the pipeline instead of being
+    # dropped by a fixed form. Strict validation: malformed slots are dropped
+    # and a filters slot is always offered; parse failure -> fixed form.
     prompt = (
-        "You read a data analyst's plain-language description of the data "
-        "they need. Decide what the follow-up request form should contain.\n\n"
+        "Act as an intake agent for a text-to-SQL dashboard. Read the data "
+        "analyst's description, classify it, and design the follow-up form.\n\n"
         "Return ONLY a JSON object with exactly these keys:\n"
         '{"request_type": "data_request"|"schema_change"|"data_change", '
         '"needs_period": true/false, "aggregate": true/false, '
@@ -65,7 +67,8 @@ def analyze_description(description):
         '"measure_hint": "<2-4 words in the analyst\'s own language>", '
         '"fields_hint": "<comma-separated list of what the result should show, '
         "in the analyst's words>\", "
-        '"systems_hint": "<the analyst\'s own words for the two systems involved>"}\n\n'
+        '"systems_hint": "<the analyst\'s own words for the two systems involved>", '
+        '"extra_fields": [<0-6 slots, see rules>]}\n\n'
         "Rules:\n"
         "- request_type: 'data_request' when the analyst asks to read/select "
         "data; 'schema_change' for DDL (drop, recreate, alter, create, rename "
@@ -76,16 +79,22 @@ def analyze_description(description):
         "- aggregate: false ONLY when the analyst clearly wants detail "
         "(all rows, every record, list each ...)\n"
         "- cross_system: true when the description compares, matches or links "
-        "data across TWO systems/catalogs/databases (e.g. 'our retail catalog "
-        "shares names with the historical sales catalog')\n"
+        "data across TWO systems/catalogs/databases\n"
         "- measure_hint: the thing being measured in the analyst's words, "
         "empty string if unclear\n"
         "- fields_hint: only what the analyst explicitly asks the result to "
-        "show (e.g. 'store name, product name'); empty string when they did "
-        "not name any specific fields\n"
-        "- systems_hint: the analyst's own words naming the two systems "
-        "(e.g. 'retail product catalog and historical sales catalog'); empty "
-        "string unless cross_system is true\n\n"
+        "show; empty string otherwise\n"
+        "- systems_hint: the analyst's own words for the two systems; empty "
+        "string unless cross_system is true\n"
+        "- extra_fields: slots for what the fixed keys do NOT capture - "
+        "filters/conditions (city, status, category, exclusions), top-N, "
+        "sorting, minimums. Each slot: {\"key\", \"label\", \"type\": "
+        "\"text\"|\"select\"|\"number\", \"options\": [only for select], "
+        "\"suggestion\"}. ALWAYS include first: {\"key\": \"filters\", "
+        '"label": "Any filters or conditions?", "type": "text", '
+        '"options": [], "suggestion": "<value from the description, or empty>"}. '
+        "Labels and suggestions in the analyst's own words - NEVER schema, "
+        "table or column names.\n\n"
         f"Description: {description}"
     )
     answer = llm(
@@ -115,7 +124,38 @@ def analyze_description(description):
         "measure_hint": str(spec.get("measure_hint", "") or ""),
         "fields_hint": str(spec.get("fields_hint", "") or ""),
         "systems_hint": str(spec.get("systems_hint", "") or ""),
+        "extra_fields": _valid_extra_fields(spec.get("extra_fields")),
     }
+
+
+def _valid_extra_fields(raw):
+    # whitelist slot types, drop malformed entries, cap at 6, and guarantee
+    # the filters slot exists (the most common lossy-constraint class)
+    fields = []
+    for entry in (raw or [])[:6]:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label", "") or "").strip()
+        ftype = str(entry.get("type", "text") or "text")
+        if not label or ftype not in ("text", "select", "number"):
+            continue
+        fields.append({
+            "key": (str(entry.get("key") or label.lower().replace(" ", "_")))[:40],
+            "label": label,
+            "type": ftype,
+            "options": [str(o) for o in (entry.get("options") or []) if str(o).strip()][:8]
+                       if ftype == "select" else [],
+            "suggestion": str(entry.get("suggestion", "") or ""),
+        })
+    if not any(f["key"] == "filters" for f in fields):
+        fields.insert(0, {
+            "key": "filters",
+            "label": "Any filters or conditions?",
+            "type": "text",
+            "options": [],
+            "suggestion": "",
+        })
+    return fields[:6]
 
 
 # aggregation wordings: form value -> analyst-language phrase
@@ -168,9 +208,17 @@ def compose_question(form):
         else:
             cross = ", matching data across the two systems involved"
 
+    # intake slots (filters, top-N, ...): every filled slot becomes one
+    # readable phrase - this is how constraints like "only New York" survive
+    extras = ""
+    for f in form.get("extra_fields") or []:
+        value = str(f.get("value") or "").strip()
+        if value and value.lower() != "none":
+            extras += f", {str(f.get('label', 'condition')).strip().rstrip('?')}: {value}"
+
     if form.get("detail"):
         return (f"Show me the {measure} as detail rows, limited to 100 rows"
-                f"{period}{cross}{showing}")
+                f"{period}{cross}{showing}{extras}")
 
     agg = (form.get("agg") or "none").strip().lower()
     if agg in _AGG_PHRASES:
@@ -179,7 +227,8 @@ def compose_question(form):
         sentence = f"Show me the {measure}"
 
     grain = (form.get("grain") or "none").strip().lower()
-    if grain != "none":
+    # skip the grain phrase when the measure already says it ("revenue per month")
+    if grain != "none" and _GRAIN_NOUNS.get(grain, grain) not in measure.lower():
         sentence += f" per {_GRAIN_NOUNS.get(grain, grain)}"
 
-    return f"{sentence}{period}{cross}{showing}"
+    return f"{sentence}{period}{cross}{showing}{extras}"

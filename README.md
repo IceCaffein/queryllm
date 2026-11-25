@@ -66,8 +66,10 @@ Key properties:
   but not trusted as join evidence — re-enable by flipping
   `CROSS_SCHEMA_DISABLED = False` in notebook 02 when verified cross-schema
   FKs exist.
-- All SQL execution is wrapped: `SELECT/WITH`-only guard, no write/DDL
-  keywords, `ROWNUM <= 20` cap.
+- **The web pipeline never touches Oracle.** Validation is static and DB-free
+  (guard + Oracle parse + catalog identifier consistency) — `query_llm` runs
+  with `execute=False` by default; execution exists only in notebooks for
+  testing (`execute=True`), and the dashboard server holds no DB credentials.
 - Speed: the writer/validator run with `enable_thinking=False` (qwen3.8-flash
   otherwise generates ~12k hidden reasoning tokens — 90% of the latency);
   the intent agent keeps thinking ON for routing accuracy. Per-stage

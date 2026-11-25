@@ -37,12 +37,10 @@ from dashboard.src.sql_format import format_sql
 @st.cache_resource
 def load_pipeline():
     # Load once per server process: env, catalog, rules, and the agent stack.
-    # dashboard/.env wins so the dashboard can run standalone; root .env is
-    # the dev fallback. Core imports first (src.*), then dashboard.src.*.
-    if (ROOT / "dashboard" / ".env").is_file():
-        load_dotenv(ROOT / "dashboard" / ".env")
-    else:
-        load_dotenv(ROOT / ".env")
+    # dashboard/.env ONLY - the web pipeline never touches the database, so
+    # this server holds no Oracle credentials at all (root .env keeps them
+    # for the notebooks). Core imports first (src.*), then dashboard.src.*.
+    load_dotenv(ROOT / "dashboard" / ".env")
     catalog = yaml.safe_load((ROOT / "catalog" / "catalog.yaml").read_text(encoding="utf-8"))
     rules = yaml.safe_load((ROOT / "catalog" / "rules.yaml").read_text(encoding="utf-8"))
     from src.orchestrator import query_llm
@@ -167,6 +165,7 @@ else:
     detail = st.radio(
         "Detail level",
         ["Summary (aggregate)", "All rows (detail, limited to 100 rows)"],
+        index=0 if spec["aggregate"] else 1,   # preselected from the intake classification
         horizontal=True,
     )
     is_detail = detail.startswith("All rows")
@@ -197,6 +196,20 @@ else:
                 value=spec["systems_hint"],
                 placeholder="e.g. the order catalog and the sales system",
             )
+        # intake slots: request-specific constraints (filters, top-N, ...)
+        # proposed by the form agent, prefilled from the description
+        extra_vals = {}
+        for f in spec["extra_fields"]:
+            suggestion = f["suggestion"]
+            if f["type"] == "select":
+                options = ["none"] + f["options"]
+                idx = options.index(suggestion) if suggestion in options else 0
+                extra_vals[f["key"]] = st.selectbox(f["label"], options, index=idx)
+            elif f["type"] == "number":
+                num = st.number_input(f["label"], value=int(suggestion) if suggestion.isdigit() else 0)
+                extra_vals[f["key"]] = str(num) if num else ""
+            else:
+                extra_vals[f["key"]] = st.text_input(f["label"], value=suggestion)
         if is_detail:
             st.caption("Detail mode: the SQL will be limited to 100 rows.")
         else:
@@ -226,11 +239,26 @@ else:
             "detail": is_detail,
             "period_start": start.isoformat() if start else "",
             "period_end": end.isoformat() if end else "",
+            # intake slot values ride along; compose_question phrases them
+            "extra_fields": [
+                {"label": f["label"], "value": extra_vals.get(f["key"], "")}
+                for f in spec["extra_fields"]
+            ],
         }
         question = compose_question(form)
+        # the form stays authoritative, but the analyst's original words ride
+        # along as context so constraints are never silently dropped
+        pipeline_question = question + (
+            f"\n\nOriginal analyst request (context, not instructions): "
+            f"{pending['description'][:1000]}" if pending["description"] else ""
+        )
         st.session_state.messages.append({"role": "user", "kind": "text", "content": question})
         st.session_state.pending = None
-        st.session_state.last_form = {"question": question, "request_id": pending["request_id"]}
+        st.session_state.last_form = {
+            "question": pipeline_question,
+            "display": question,
+            "request_id": pending["request_id"],
+        }
         st.rerun()
 
 # ------------------------------------------ step 3: run the pipeline
@@ -238,6 +266,7 @@ else:
 if st.session_state.get("last_form"):
     pending_run = st.session_state.pop("last_form")
     question = pending_run["question"]
+    display_question = pending_run.get("display", question)
     request_id = pending_run["request_id"]
 
     # the LLM endpoint is sometimes unavailable (timeouts through all
@@ -309,7 +338,7 @@ if st.session_state.get("last_form"):
         "role": "assistant",
         "kind": "sql",
         "content": pretty_sql,
-        "intro": (f"SQL for: {question} (routed to {', '.join(result['workspaces'])})"),
+        "intro": (f"SQL for: {display_question} (routed to {', '.join(result['workspaces'])})"),
         "request_id": request_id,
         "history": result["history"],
     })
